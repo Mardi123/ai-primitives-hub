@@ -51,6 +51,11 @@
     ],
     "commands": [
       {
+        "command": "promptRegistry.deployToTarget",
+        "title": "Deploy Bundle to Target (Kiro, Claude Code, VS Code…)",
+        "category": "AI Primitives Hub"
+      },
+      {
         "command": "promptRegistry.resetFirstRun",
         "title": "Reset First Run (for Testing)",
         "category": "AI Primitives Hub"

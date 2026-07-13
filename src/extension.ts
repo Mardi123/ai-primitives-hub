@@ -12,6 +12,9 @@ import {
   CreateCollectionCommand,
 } from './commands/create-collection-command';
 import {
+  registerDeployToTargetCommand,
+} from './commands/deploy-to-target-command';
+import {
   GitHubAuthCommand,
 } from './commands/github-auth-command';
 import {
@@ -466,7 +469,10 @@ export class PromptRegistryExtension {
         }
       }),
 
-      vscode.commands.registerCommand('promptregistry.forceGitHubAuth', () => githubAuthCommand.execute())
+      vscode.commands.registerCommand('promptregistry.forceGitHubAuth', () => githubAuthCommand.execute()),
+
+      // Multi-IDE target deploy (additive; uses src/services/targets engine)
+      registerDeployToTargetCommand()
     ];
 
     // Add to disposables
