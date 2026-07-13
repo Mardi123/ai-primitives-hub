@@ -108,6 +108,9 @@ export interface InstalledBundle {
   sourceType?: string; // Source type for identity matching (github, local, etc.)
   commitMode?: RepositoryCommitMode; // Commit mode for repository-scoped installations
   filesMissing?: boolean; // Set when lockfile entry exists but files are missing (repository scope only)
+  // Absolute paths written by the multi-IDE target engine (e.g. Kiro `.kiro/**`).
+  // Present only when installed into a non-Copilot host; used for uninstall.
+  deployedTargetFiles?: string[];
 }
 
 /**

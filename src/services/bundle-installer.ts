@@ -74,6 +74,20 @@ import {
 import {
   UserScopeService,
 } from './user-scope-service';
+import {
+  deployDirectoryToTarget,
+  removeKiroMcpServers,
+  syncKiroMcpServers,
+} from './target-install-bridge';
+import {
+  detectTargetFromAppName,
+} from './targets/ide-detector';
+import {
+  isKiroTarget,
+} from './targets/target-types';
+import type {
+  Target,
+} from './targets/target-types';
 
 const mkdir = promisify(fs.mkdir);
 const writeFile = promisify(fs.writeFile);
@@ -117,6 +131,29 @@ export class BundleInstaller {
   }
 
   /**
+   * Resolve a Kiro deploy target from the host editor, or null if the host is
+   * not Kiro. When non-null, installs are routed through the multi-IDE engine
+   * (deploying to `.kiro/**`) instead of the Copilot scope services — so the
+   * Install button "just works" in Kiro exactly as it does in VS Code.
+   *
+   * Non-Kiro hosts (VS Code, Copilot CLI, Windsurf forks) return null and take
+   * the existing, unchanged Copilot install path — guaranteeing no regression.
+   * @param scope - The requested installation scope.
+   */
+  private resolveKiroTarget(scope: InstallationScope): Target | null {
+    const targetType = detectTargetFromAppName(vscode.env.appName);
+    if (!isKiroTarget(targetType)) {
+      return null;
+    }
+    const targetScope = scope === 'repository' || scope === 'workspace' ? 'repository' : 'user';
+    const workspaceRoot = targetScope === 'repository' ? getWorkspaceRoot() : undefined;
+    if (targetScope === 'repository' && !workspaceRoot) {
+      throw new Error('Repository scope requires an open workspace. Please open a workspace and try again.');
+    }
+    return { type: targetType, scope: targetScope, workspaceRoot };
+  }
+
+  /**
    * Collect file entries with checksums for lockfile
    * @param installDir
    * @param workspaceRoot
@@ -155,6 +192,48 @@ export class BundleInstaller {
    * @param options
    * @param sourceType
    */
+  /**
+   * Lockfile update for engine-deployed installs (e.g. Kiro), where files live
+   * outside `.github/`. Builds entries from the recorded deployed file paths.
+   */
+  private async updateLockfileForDeployedFiles(
+    bundle: Bundle,
+    installed: InstalledBundle,
+    options: InstallOptions,
+    sourceType?: string
+  ): Promise<void> {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+      this.logger.warn('Cannot update lockfile: no workspace root');
+      return;
+    }
+    try {
+      const lockfileManager = LockfileManager.getInstance(workspaceRoot);
+      const files: LockfileFileEntry[] = [];
+      for (const abs of installed.deployedTargetFiles ?? []) {
+        if (fs.existsSync(abs)) {
+          files.push({ path: path.relative(workspaceRoot, abs), checksum: await calculateFileChecksum(abs) });
+        }
+      }
+      const source: LockfileSourceEntry = {
+        type: sourceType || installed.sourceType || 'unknown',
+        url: bundle.downloadUrl || bundle.manifestUrl || ''
+      };
+      await lockfileManager.createOrUpdate({
+        bundleId: bundle.id,
+        version: bundle.version,
+        sourceId: bundle.sourceId,
+        sourceType: sourceType || installed.sourceType || 'unknown',
+        commitMode: options.commitMode ?? 'commit',
+        files,
+        source
+      });
+      this.logger.debug(`Updated lockfile (deployed files) for bundle ${bundle.id}`);
+    } catch (error) {
+      this.logger.error('Failed to update lockfile for deployed files', error as Error);
+    }
+  }
+
   private async updateLockfileOnInstall(
     bundle: Bundle,
     installed: InstalledBundle,
@@ -743,11 +822,16 @@ export class BundleInstaller {
       const manifest = await this.validateBundle(extractDir, bundle);
       this.logger.debug('Bundle validation passed');
 
+      // If the host editor is Kiro, route deployment through the multi-IDE
+      // engine (→ `.kiro/**`) instead of the Copilot scope services.
+      const kiroTarget = this.resolveKiroTarget(options.scope);
+
       // Check if this is a skills bundle (Anthropic-style skills source)
       const isSkillsBundle = sourceType === 'skills' || sourceType === 'local-skills';
       // For repository scope we must still run through the standard sync/lockfile flow; only
       // user/workspace scopes should install directly into the Copilot skills directory.
-      const installSkillsToCopilotDir = isSkillsBundle && options.scope !== 'repository';
+      // On Kiro we always use the standard path so the engine handles skills too.
+      const installSkillsToCopilotDir = isSkillsBundle && options.scope !== 'repository' && !kiroTarget;
 
       let installDir: string;
 
@@ -822,8 +906,27 @@ export class BundleInstaller {
         commitMode: options.scope === 'repository' ? (options.commitMode ?? 'commit') : undefined
       };
 
-      // Step 9: Install MCP servers if defined (skip for skills bundles)
-      if (installSkillsToCopilotDir) {
+      // Step 9: Deploy. Kiro host → multi-IDE engine; otherwise the existing
+      // Copilot scope-service flow (unchanged — no regression for VS Code).
+      if (kiroTarget) {
+        const result = await deployDirectoryToTarget(installDir, kiroTarget);
+        installed.deployedTargetFiles = result.written.map((w) => w.destPath);
+        this.logger.info(
+          `Deployed ${result.written.length} file(s) to ${kiroTarget.type} (${kiroTarget.scope}); ` +
+            `${result.skipped.length} skipped, ${result.adapted.length} adapted.`
+        );
+        for (const warn of result.warnings) {
+          this.logger.warn(warn);
+        }
+
+        // Merge any MCP servers into Kiro's mcp.json (same schema as the manifest).
+        await syncKiroMcpServers(kiroTarget, manifest.mcpServers);
+
+        // Track repository-scope installs in the lockfile (using the deployed files).
+        if (kiroTarget.scope === 'repository') {
+          await this.updateLockfileForDeployedFiles(bundle, installed, options, sourceType);
+        }
+      } else if (installSkillsToCopilotDir) {
         this.logger.debug('Skills bundle - skipping MCP servers and Copilot sync (already installed to ~/.copilot/skills/)');
       } else {
         // Skills bundles going through repository scope should still skip MCP servers
@@ -858,22 +961,70 @@ export class BundleInstaller {
    * Uninstall a bundle
    * @param installed
    */
+  /**
+   * Remove files written by the multi-IDE engine and prune any dirs left empty.
+   * @param files - Absolute paths recorded at install time.
+   */
+  private async removeDeployedTargetFiles(files: string[]): Promise<void> {
+    const dirs = new Set<string>();
+    for (const file of files) {
+      try {
+        if (fs.existsSync(file)) {
+          await unlink(file);
+        }
+        dirs.add(path.dirname(file));
+      } catch {
+        this.logger.warn(`Failed to remove deployed file: ${file}`);
+      }
+    }
+    // Prune now-empty directories, deepest first (best-effort).
+    for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
+      try {
+        if (fs.existsSync(dir) && (await readdir(dir)).length === 0) {
+          await rmdir(dir);
+        }
+      } catch {
+        /* leave non-empty / shared dirs alone */
+      }
+    }
+  }
+
   public async uninstall(installed: InstalledBundle): Promise<void> {
     this.logger.info(`Uninstalling bundle: ${installed.bundleId}`);
 
     try {
-      // Uninstall MCP servers
-      await this.uninstallMcpServers(installed.bundleId, installed.scope);
-      this.logger.debug('MCP servers uninstalled');
+      if (installed.deployedTargetFiles && installed.deployedTargetFiles.length > 0) {
+        // Installed via the multi-IDE engine (e.g. Kiro): remove the exact files
+        // it wrote, then prune any directories left empty.
+        await this.removeDeployedTargetFiles(installed.deployedTargetFiles);
+        this.logger.debug(`Removed ${installed.deployedTargetFiles.length} engine-deployed file(s)`);
 
-      // Unsync from appropriate scope directory
-      const scopeService = this.getScopeService(installed.scope);
-      await scopeService.unsyncBundle(installed.bundleId);
-      this.logger.debug(`Removed from ${installed.scope} scope`);
+        // Remove this bundle's MCP servers from Kiro's mcp.json.
+        const target: Target = {
+          type: 'kiro-ide',
+          scope: installed.scope === 'repository' ? 'repository' : 'user',
+          workspaceRoot: installed.scope === 'repository' ? getWorkspaceRoot() : undefined
+        };
+        await removeKiroMcpServers(target, Object.keys(installed.manifest.mcpServers ?? {}));
 
-      // Remove from lockfile for repository scope
-      if (installed.scope === 'repository') {
-        await this.updateLockfileOnUninstall(installed.bundleId);
+        // Remove lockfile entry for repository scope.
+        if (installed.scope === 'repository') {
+          await this.updateLockfileOnUninstall(installed.bundleId);
+        }
+      } else {
+        // Uninstall MCP servers
+        await this.uninstallMcpServers(installed.bundleId, installed.scope);
+        this.logger.debug('MCP servers uninstalled');
+
+        // Unsync from appropriate scope directory
+        const scopeService = this.getScopeService(installed.scope);
+        await scopeService.unsyncBundle(installed.bundleId);
+        this.logger.debug(`Removed from ${installed.scope} scope`);
+
+        // Remove from lockfile for repository scope
+        if (installed.scope === 'repository') {
+          await this.updateLockfileOnUninstall(installed.bundleId);
+        }
       }
 
       // Remove installation directory (bundle cache)
